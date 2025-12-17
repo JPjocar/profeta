@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NoIntuition</title>
+  <style>
+    body{
+      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: radial-gradient(1200px 800px at 10% 10%, #5b9dff33, transparent),
+                  radial-gradient(1000px 700px at 90% 20%, #ff7ad933, transparent),
+                  radial-gradient(1000px 800px at 50% 90%, #7cffd933, transparent),
+                  #0b1220;
+      color:#eaf0ff; min-height:100vh; display:grid; place-items:center;
+    }
+    .glass{
+      width:min(720px, 92vw);
+      background: rgba(255,255,255,0.10);
+      border: 1px solid rgba(255,255,255,0.18);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border-radius: 18px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+      padding:20px;
+    }
+    h1{ margin:0 0 8px 0; font-size:34px; }
+    .muted{ opacity:.85; }
+    input, button{
+      width:100%; padding:12px 14px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.18);
+      background: rgba(10,18,32,0.35);
+      color:#eaf0ff; outline:none;
+    }
+    button{ cursor:pointer; font-weight:600; margin-top:10px; }
+    .row{ display:flex; gap:10px; margin-top:10px; }
+    .bar{ margin-top:12px; padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,0.18); }
+    .hidden{ display:none; }
+    .alert{ margin-top:12px; padding:12px 14px; border-radius:12px; background: rgba(255,80,80,0.18); border:1px solid rgba(255,80,80,0.35); }
+  </style>
+</head>
+<body>
+  <div class="glass">
+    <h1>NoIntuition</h1>
+    <div class="muted">Sube tu Excel/CSV con columnas: id_venta, nombre_producto, fecha_venta, cantidad</div>
+
+    <input id="file" type="file" accept=".xlsx,.xls,.csv" style="margin-top:14px;"/>
+
+    <div class="row">
+      <button id="btnUpload">Subir Excel</button>
+      <button id="btnCancel" type="button" class="hidden">Cancelar</button>
+    </div>
+
+    <div id="progressBox" class="bar hidden">
+      <div id="progressText">Cargando excel…</div>
+      <div id="progressPct" class="muted" style="margin-top:6px;"></div>
+    </div>
+
+    <div id="alertBox" class="alert hidden"></div>
+  </div>
+
+<script>
+  function getCookie(name){
+    const v = `; ${document.cookie}`;
+    const parts = v.split(`; ${name}=`);
+    if (parts.length === 2) return parts.pop().split(';').shift();
+  }
+
+  const fileEl = document.getElementById("file");
+  const btnUpload = document.getElementById("btnUpload");
+  const btnCancel = document.getElementById("btnCancel");
+  const progressBox = document.getElementById("progressBox");
+  const progressText = document.getElementById("progressText");
+  const progressPct = document.getElementById("progressPct");
+  const alertBox = document.getElementById("alertBox");
+
+  let xhr = null;
+
+  function showError(msg){
+    alertBox.textContent = msg;
+    alertBox.classList.remove("hidden");
+  }
+  function clearError(){
+    alertBox.classList.add("hidden");
+    alertBox.textContent = "";
+  }
+
+  btnUpload.onclick = () => {
+    clearError();
+    const f = fileEl.files[0];
+    if (!f){ showError("Selecciona un archivo primero."); return; }
+
+    const form = new FormData();
+    form.append("file", f);
+
+    xhr = new XMLHttpRequest();
+    xhr.open("POST", "/upload/", true);
+    xhr.setRequestHeader("X-CSRFToken", getCookie("csrftoken"));
+
+    progressBox.classList.remove("hidden");
+    btnCancel.classList.remove("hidden");
+    progressText.textContent = "Cargando excel…";
+    progressPct.textContent = "";
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable){
+        const pct = Math.round((e.loaded / e.total) * 100);
+        progressPct.textContent = pct + "%";
+      } else {
+        progressPct.textContent = "";
+      }
+    };
+
+    xhr.onload = () => {
+      btnCancel.classList.add("hidden");
+      if (xhr.status >= 200 && xhr.status < 300){
+        const data = JSON.parse(xhr.responseText);
+        if (data.ok){
+          window.location.href = data.redirect || "/forecast/";
+        } else {
+          showError(data.error || "Error desconocido.");
+        }
+      } else {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          showError(data.error || "Error al subir/leer el archivo.");
+        } catch {
+          showError("Error al subir/leer el archivo.");
+        }
+      }
+    };
+
+    xhr.onerror = () => {
+      btnCancel.classList.add("hidden");
+      showError("Fallo de red durante la subida.");
+    };
+
+    xhr.send(form);
+  };
+
+  btnCancel.onclick = () => {
+    if (xhr) xhr.abort();
+    progressText.textContent = "Subida cancelada.";
+    btnCancel.classList.add("hidden");
+  };
+</script>
+</body>
+</html>

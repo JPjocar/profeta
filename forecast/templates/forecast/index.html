@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NoIntuition - Forecast</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+      *{
+      box-sizing: border-box;
+      }
+    body{
+      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: radial-gradient(1200px 800px at 10% 10%, #5b9dff33, transparent),
+                  radial-gradient(1000px 700px at 90% 20%, #ff7ad933, transparent),
+                  radial-gradient(1000px 800px at 50% 90%, #7cffd933, transparent),
+                  #0b1220;
+      color:#eaf0ff; min-height:100vh;
+    }
+    .wrap{ max-width:1100px; margin:0 auto; padding:24px; display:grid; grid-template-columns: 360px 1fr; gap:18px; }
+    .glass{
+      background: rgba(255,255,255,0.10);
+      border: 1px solid rgba(255,255,255,0.18);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border-radius: 18px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+    }
+    .panel{ padding:16px; }
+    label{ display:block; font-size:12px; opacity:.9; margin-top:12px; margin-bottom:6px; }
+    input, button{
+      width:100%; padding:10px 12px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.18);
+      background: rgba(10,18,32,0.35);
+      color:#eaf0ff; outline:none;
+    }
+    button{ margin-top:14px; cursor:pointer; font-weight:600; }
+    .list{ margin-top:14px; height:420px; overflow:auto; border-radius:14px; border:1px solid rgba(255,255,255,0.14); }
+    .item{ padding:10px 12px; border-bottom:1px solid rgba(255,255,255,0.10); cursor:pointer; }
+    .item:hover{ background: rgba(255,255,255,0.08); }
+    .muted{ opacity:.85; font-size:13px; }
+    .error{ background: rgba(255,80,80,0.18); border:1px solid rgba(255,80,80,0.35); padding:10px 12px; border-radius:12px; }
+    table{ width:100%; border-collapse: collapse; }
+    th, td{ text-align:left; padding:10px 12px; border-bottom:1px solid rgba(255,255,255,0.10); }
+    canvas{ width:100% !important; height:380px !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="glass panel">
+      <div class="muted">Dataset: {{ dataset_name }}</div>
+
+      <form method="post" style="margin-top:10px;">
+        {% csrf_token %}
+        <label>Producto</label>
+        <input id="productInput" name="product_name" placeholder="Escribe o selecciona..." value="{{ product_name|default:'' }}" autocomplete="off"/>
+
+        <label>Horizonte (días)</label>
+        <input name="horizon_days" type="number" min="1"
+               max="{{ horizon_max|default:horizon_max_default }}"
+               value="{{ horizon_days|default:14 }}"/>
+
+        <button type="submit">Predecir</button>
+
+        {% if horizon_max %}
+          <div class="muted" style="margin-top:10px;">Máximo recomendado para este producto: {{ horizon_max }} días</div>
+        {% endif %}
+        {% if error %}
+          <div class="error" style="margin-top:12px;">{{ error }}</div>
+        {% endif %}
+      </form>
+
+      <div style="margin-top:14px;" class="muted">Productos (scroll, 100 por carga)</div>
+      <div id="productList" class="list"></div>
+    </div>
+
+    <div class="glass panel">
+      <div class="muted">Evaluación 80/20</div>
+      <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:6px;">
+        <div class="muted">MAE: {{ mae|default:"-" }}</div>
+        <div class="muted">MAPE%: {{ mape|default:"-" }}</div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <canvas id="chart"></canvas>
+      </div>
+
+      <div style="margin-top:14px;">
+        <div class="muted" style="margin-bottom:6px;">Predicción futura (días)</div>
+        <div class="glass" style="padding:0 12px;">
+          <table>
+            <thead><tr><th>Fecha</th><th>Cantidad</th></tr></thead>
+            <tbody>
+              {% for d, y in table_rows %}
+                <tr><td>{{ d }}</td><td>{{ y }}</td></tr>
+              {% empty %}
+                <tr><td colspan="2" class="muted">Aún no se ha generado predicción.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {{ chart_payload|json_script:"chart-data" }}
+
+<script>
+  // Lista productos: paginado + filtro
+  const listEl = document.getElementById("productList");
+  const inputEl = document.getElementById("productInput");
+  let page = 1, loading = false, hasMore = true, currentSearch = "";
+
+  function addItems(items){
+    for (const name of items){
+      const div = document.createElement("div");
+      div.className = "item";
+      div.textContent = name;
+      div.onclick = () => { inputEl.value = name; };
+      listEl.appendChild(div);
+    }
+  }
+  async function loadProducts(reset=false){
+    if (loading || (!hasMore && !reset)) return;
+    loading = true;
+    if (reset){ page = 1; hasMore = true; listEl.innerHTML = ""; }
+    const res = await fetch(`/api/products/?page=${page}&search=${encodeURIComponent(currentSearch)}`);
+    const data = await res.json();
+    addItems(data.items || []);
+    hasMore = !!data.has_more;
+    page += 1;
+    loading = false;
+  }
+  listEl.addEventListener("scroll", () => {
+    const nearBottom = listEl.scrollTop + listEl.clientHeight >= listEl.scrollHeight - 30;
+    if (nearBottom) loadProducts(false);
+  });
+  let t=null;
+  inputEl.addEventListener("input", () => {
+    clearTimeout(t);
+    t = setTimeout(() => { currentSearch = inputEl.value.trim(); loadProducts(true); }, 250);
+  });
+  loadProducts(true);
+
+  // Gráfico
+  const payload = JSON.parse(document.getElementById("chart-data").textContent);
+  const labels = payload.labels || [];
+  const hist = payload.hist || [];
+  const yhat = payload.yhat || [];
+
+  const ctx = document.getElementById("chart").getContext("2d");
+
+  if (!labels.length){
+    // No rompe si aún no hay predicción
+    ctx.font = "14px system-ui";
+    ctx.fillStyle = "rgba(234,240,255,0.8)";
+    ctx.fillText("Genera una predicción para ver el gráfico.", 10, 30);
+  } else {
+    new Chart(ctx, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          { label: "Histórico", data: hist, spanGaps: true, borderWidth: 2 },
+          { label: "Predicción", data: yhat, borderWidth: 2 },
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: "#eaf0ff" } } },
+        scales: {
+          x: { ticks: { color: "#eaf0ff" }, grid: { color: "rgba(255,255,255,0.08)" } },
+          y: { ticks: { color: "#eaf0ff" }, grid: { color: "rgba(255,255,255,0.08)" } }
+        }
+      }
+    });
+  }
+</script>
+</body>
+</html>
