@@ -45,7 +45,7 @@ def _normalize_and_validate(df: pd.DataFrame) -> pd.DataFrame:
     if df["nombre_producto"].eq("").any():
         raise ValueError("Hay filas con 'nombre_producto' vacío.")
 
-    df["fecha_venta"] = pd.to_datetime(df["fecha_venta"], errors="coerce")
+    df["fecha_venta"] = pd.to_datetime(df["fecha_venta"], errors="coerce", dayfirst=True)
     if df["fecha_venta"].isna().any():
         raise ValueError("Hay fechas inválidas en 'fecha_venta'.")
 
