@@ -3,47 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>NoIntuition - Forecast</title>
+  <title>NoIntuition</title>
+     <link rel="shortcut icon" href="../static/jakataicon.png" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-      *{
-      box-sizing: border-box;
-      }
-    body{
-      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      background: radial-gradient(1200px 800px at 10% 10%, #5b9dff33, transparent),
-                  radial-gradient(1000px 700px at 90% 20%, #ff7ad933, transparent),
-                  radial-gradient(1000px 800px at 50% 90%, #7cffd933, transparent),
-                  #0b1220;
-      color:#eaf0ff; min-height:100vh;
-    }
-    .wrap{ max-width:1100px; margin:0 auto; padding:24px; display:grid; grid-template-columns: 360px 1fr; gap:18px; }
-    .glass{
-      background: rgba(255,255,255,0.10);
-      border: 1px solid rgba(255,255,255,0.18);
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
-      border-radius: 18px;
-      box-shadow: 0 12px 40px rgba(0,0,0,0.35);
-    }
-    .panel{ padding:16px; }
-    label{ display:block; font-size:12px; opacity:.9; margin-top:12px; margin-bottom:6px; }
-    input, button{
-      width:100%; padding:10px 12px; border-radius:12px;
-      border:1px solid rgba(255,255,255,0.18);
-      background: rgba(10,18,32,0.35);
-      color:#eaf0ff; outline:none;
-    }
-    button{ margin-top:14px; cursor:pointer; font-weight:600; }
-    .list{ margin-top:14px; height:420px; overflow:auto; border-radius:14px; border:1px solid rgba(255,255,255,0.14); }
-    .item{ padding:10px 12px; border-bottom:1px solid rgba(255,255,255,0.10); cursor:pointer; }
-    .item:hover{ background: rgba(255,255,255,0.08); }
-    .muted{ opacity:.85; font-size:13px; }
-    .error{ background: rgba(255,80,80,0.18); border:1px solid rgba(255,80,80,0.35); padding:10px 12px; border-radius:12px; }
-    table{ width:100%; border-collapse: collapse; }
-    th, td{ text-align:left; padding:10px 12px; border-bottom:1px solid rgba(255,255,255,0.10); }
-    canvas{ width:100% !important; height:380px !important; }
-  </style>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:ital,wght@0,200..700;1,200..700&family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../static/indexstyle.css">
 </head>
 <body>
   <div class="wrap">
@@ -55,10 +22,20 @@
         <label>Producto</label>
         <input id="productInput" name="product_name" placeholder="Escribe o selecciona..." value="{{ product_name|default:'' }}" autocomplete="off"/>
 
-        <label>Horizonte (días)</label>
-        <input name="horizon_days" type="number" min="1"
-               max="{{ horizon_max|default:horizon_max_default }}"
-               value="{{ horizon_days|default:14 }}"/>
+        <label id="horizonLabel">
+          Horizonte ({{ horizon_unit|default:"días" }}):
+        </label>
+        <input type="number" name="horizon_days" id="horizonInput" min="1"
+               placeholder="Ej: 30" />
+        <small id="horizonHelp">
+          Máximo recomendado: {{ horizon_max|default:horizon_max_default }}
+        </small>
+
+          <label for="granularity">Frecuencia:</label>
+            <select id="granularity" name="granularity">
+              <option value="daily" {% if granularity == "daily" %}selected{% endif %}>Diario</option>
+              <option value="monthly" {% if granularity == "monthly" %}selected{% endif %}>Mensual</option>
+            </select>
 
         <button type="submit">Predecir</button>
 
@@ -87,7 +64,7 @@
       </div>
 
       <div style="margin-top:14px;">
-        <div class="muted" style="margin-bottom:6px;">Predicción futura (días)</div>
+        <div id="muted" class="muted" style="margin-bottom:6px;">Predicción futura (días)</div>
         <div class="glass" style="padding:0 12px;">
           <table>
             <thead><tr><th>Fecha</th><th>Cantidad</th></tr></thead>
@@ -107,6 +84,27 @@
   {{ chart_payload|json_script:"chart-data" }}
 
 <script>
+     const sel = document.getElementById("granularity");
+  const label = document.getElementById("horizonLabel");
+  const help = document.getElementById("horizonHelp");
+const muted = document.getElementById("muted");
+
+  function refreshUI() {
+    const g = sel.value;
+    const maxDaily = {{ horizon_max_default_daily|default:90 }};
+    const maxMonthly = {{ horizon_max_default_monthly|default:24 }};
+    if (g === "monthly") {
+      label.textContent = "Horizonte (meses):";
+      help.textContent = "Máximo recomendado: " + maxMonthly;
+      muted.textContent = "Predicción futura (Meses)"
+    } else {
+      label.textContent = "Horizonte (días):";
+      help.textContent = "Máximo recomendado: " + maxDaily;
+      muted.textContent = "Predicción futura (Dias)"
+    }
+  }
+  sel.addEventListener("change", refreshUI);
+  refreshUI();
   // Lista productos: paginado + filtro
   const listEl = document.getElementById("productList");
   const inputEl = document.getElementById("productInput");

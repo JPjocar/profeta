@@ -14,34 +14,29 @@ from sklearn.metrics import mean_absolute_error
 
 from .models import Dataset, Product, SaleDaily
 
-# -----------------------------
-# Configuración general del Excel estándar
-# -----------------------------
+
+# ============================================================
+# Configuración general del Excel estándar (COMPARTIDO)
+# ============================================================
 REQUIRED_COLS = ["id_venta", "nombre_producto", "fecha_venta", "cantidad"]
 
 CSV_CHUNKSIZE = 200_000
 BULK_BATCH_SIZE = 5000
 
 
-# -----------------------------
-# Utilidades de sesión/dataset
-# -----------------------------
+# Create session or get last session
 def _ensure_session(request) -> str:
-    """Asegura que exista session_key (para asociar el dataset al usuario)."""
     if not request.session.session_key:
         request.session.create()
     return request.session.session_key
 
-
+# Get dataset
 def _get_dataset(request) -> Dataset | None:
-    """Recupera el último dataset subido por este usuario (sesión)."""
     session_key = _ensure_session(request)
     return Dataset.objects.filter(session_key=session_key).order_by("-created_at").first()
 
 
-# -----------------------------
-# Limpieza + agregación diaria (para carga a BD)
-# -----------------------------
+# Clean data and validate
 def _normalize_and_validate(df: pd.DataFrame) -> pd.DataFrame:
     """
     Recibe un DataFrame con las columnas requeridas.
@@ -79,11 +74,8 @@ def _normalize_and_validate(df: pd.DataFrame) -> pd.DataFrame:
     return df[["nombre_producto", "ds", "y"]]
 
 
+# Agrupamos por nombre y sello de fecha
 def _aggregate_daily(df_norm: pd.DataFrame) -> pd.DataFrame:
-    """
-    Agrupa por (producto, día) y suma cantidades.
-    Devuelve: nombre_producto, ds, y (y = total vendido ese día).
-    """
     daily = (
         df_norm.groupby(["nombre_producto", "ds"], as_index=False)
         .agg(y=("y", "sum"))
@@ -92,10 +84,7 @@ def _aggregate_daily(df_norm: pd.DataFrame) -> pd.DataFrame:
 
 
 def _read_user_file(file_obj, filename: str) -> pd.DataFrame:
-    """
-    Lee Excel/CSV y devuelve DataFrame agregado diario: (producto, ds, y)
-    NOTA: Para performance, solo leemos las 4 columnas necesarias.
-    """
+
     lower = (filename or "").lower()
 
     if lower.endswith(".csv"):
@@ -116,9 +105,158 @@ def _read_user_file(file_obj, filename: str) -> pd.DataFrame:
     return daily
 
 
-# -----------------------------
-# Serie mensual para Prophet
-# -----------------------------
+# ============================================================
+# ----------- BLOQUE DAILY (copiado de tu daily) -------------
+# ============================================================
+def build_prophet(n_days: int) -> Prophet:
+    """
+    Crea un Prophet apropiado según el tamaño del histórico (en días).
+    - Con poco histórico: modelo conservador (evita sobreajuste).
+    - Con más histórico: permite más componentes.
+    """
+    weekly = n_days >= 14
+    yearly = n_days >= 365
+
+    # Parámetros conservadores por defecto
+    m = Prophet(
+        weekly_seasonality=True,
+        yearly_seasonality=True,
+        daily_seasonality=False,
+        changepoint_range=0.9,
+        changepoint_prior_scale=0.01,
+        seasonality_prior_scale=5,
+        seasonality_mode="multiplicative",
+    )
+
+    # “Mensual” aproximada solo si hay suficiente histórico (evita inventar ondas con pocos días)
+    if n_days >= 90:
+        m.add_seasonality(name="monthly", period=30.5, fourier_order=5)
+
+    return m
+
+
+def _max_horizon_days(n_days: int) -> int:
+    """
+    Límite de horizonte para evitar extrapolación mala.
+    Regla: máximo 90 días, y nunca más de la mitad del histórico.
+    """
+    return max(3, min(90, n_days // 2))
+
+
+def _prepare_series_daily(df_product: pd.DataFrame) -> pd.DataFrame:
+    """
+    Entrada: df_product con ds,y para un producto.
+    Salida: serie diaria continua (rellena días faltantes con 0).
+    """
+    df_product = df_product.sort_values("ds").copy()
+
+    # Rango completo diario
+    full = pd.DataFrame({"ds": pd.date_range(df_product["ds"].min(), df_product["ds"].max(), freq="D")})
+    out = full.merge(df_product[["ds", "y"]], on="ds", how="left")
+
+    # Día sin registro = 0 ventas (retail)
+    out["y"] = pd.to_numeric(out["y"], errors="coerce").fillna(0.0).astype(float)
+    return out
+
+
+def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
+    product_name = (request.POST.get("product_name") or "").strip()
+    horizon = int(request.POST.get("horizon_days") or 0)
+
+    product = Product.objects.filter(dataset=dataset, name__iexact=product_name).first()
+    if not product:
+        context["error"] = "Producto no encontrado (selecciónalo de la lista)."
+        return context
+
+    # Serie diaria agregada desde BD
+    qs = (
+        SaleDaily.objects
+        .filter(dataset=dataset, product=product)
+        .values("date")
+        .annotate(y=Sum("qty"))
+        .order_by("date")
+    )
+    df = pd.DataFrame(list(qs))
+    if df.empty:
+        context["error"] = "No hay datos para ese producto."
+        return context
+
+    df["ds"] = pd.to_datetime(df["date"])
+    df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).astype(float)
+    df = df[["ds", "y"]]
+    df = _prepare_series_daily(df)
+
+    n_days = len(df)
+    if n_days < 14:
+        context["error"] = "Histórico insuficiente (mínimo recomendado: 14 días)."
+        return context
+
+    horizon_max = _max_horizon_days(n_days)
+    context["horizon_max"] = horizon_max
+    context["horizon_unit"] = "días"
+
+    if horizon < 1 or horizon > horizon_max:
+        context["error"] = f"Horizonte inválido. Máximo recomendado: {horizon_max} días."
+        return context
+
+    # Split 80/20 temporal
+    split = int(n_days * 0.8)
+    train = df.iloc[:split].copy()
+    test = df.iloc[split:].copy()
+
+    # Modelo para evaluación
+    m = build_prophet(len(train))
+    m.fit(train)
+
+    pred_test = m.predict(test[["ds"]])
+    mae = float(mean_absolute_error(test["y"].to_numpy(), pred_test["yhat"].to_numpy()))
+
+    # MAPE (ignora y_true == 0)
+    y_true = test["y"].to_numpy(dtype=float)
+    y_pred = pred_test["yhat"].to_numpy(dtype=float)
+    mask = y_true != 0
+    mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0) if mask.any() else None
+
+    # Modelo final con todo el histórico
+    m2 = build_prophet(len(df))
+    m2.fit(df)
+
+    future = m2.make_future_dataframe(periods=horizon, freq="D", include_history=True)
+    forecast = m2.predict(future)
+
+    labels = forecast["ds"].dt.strftime("%Y-%m-%d").tolist()
+    yhat = forecast["yhat"].clip(lower=0).round(2).tolist()
+
+    hist_map = dict(zip(df["ds"].dt.strftime("%Y-%m-%d"), df["y"].round(2)))
+    hist = [hist_map.get(d, None) for d in labels]
+
+    future_table = forecast.tail(horizon).copy()
+    table_rows = list(zip(
+        future_table["ds"].dt.strftime("%Y-%m-%d").tolist(),
+        future_table["yhat"].clip(lower=0).round(2).tolist()
+    ))
+
+    # UI: formateo opcional coherente con tu mensual (strings)
+    avg_y = float(df["y"].mean()) if len(df) else 0.0
+    nmae = (mae / avg_y * 100.0) if avg_y > 0 else None
+
+    context.update({
+        "product_name": product.name,
+        "horizon_days": horizon,
+        "mae": f"{mae:,.2f}",
+        "mape": "-" if mape is None else f"{mape:.2f}%",
+        "nmae": "-" if nmae is None else f"{nmae:.2f}%",
+        "avg_y": f"{avg_y:,.2f}",
+        "chart_payload": {"labels": labels, "hist": hist, "yhat": yhat},
+        "table_rows": table_rows,
+    })
+
+    return context
+
+
+# ============================================================
+# --------- BLOQUE MONTHLY (copiado de tu mensual) -----------
+# ============================================================
 def _prepare_series_monthly(df_daily: pd.DataFrame) -> pd.DataFrame:
     """
     Entrada: df_daily con ds (datetime) y y (float) a nivel diario.
@@ -127,7 +265,6 @@ def _prepare_series_monthly(df_daily: pd.DataFrame) -> pd.DataFrame:
     dfp = df_daily.sort_values("ds").copy()
     dfp["ds"] = pd.to_datetime(dfp["ds"])
 
-    # Resample mensual: inicio de mes (MS)
     s = dfp.set_index("ds")["y"].resample("MS").sum()
 
     full_idx = pd.date_range(s.index.min(), s.index.max(), freq="MS")
@@ -145,9 +282,6 @@ def _max_horizon_months(n_months: int) -> int:
     return max(1, min(24, n_months // 2))
 
 
-# -----------------------------
-# Prophet (modelo mensual + tuning)
-# -----------------------------
 def _build_prophet_monthly(
     n_months: int,
     changepoint_prior_scale: float = 0.05,
@@ -155,7 +289,6 @@ def _build_prophet_monthly(
 ) -> Prophet:
     yearly = n_months >= 24
 
-    # n_changepoints: razonable para mensual (evita demasiados puntos con poco histórico)
     n_changepoints = int(min(25, max(5, n_months // 2)))
 
     m = Prophet(
@@ -185,7 +318,6 @@ def _tune_prophet_monthly(train: pd.DataFrame, test: pd.DataFrame) -> dict:
     Tuning pequeño para bajar MAE sin que se vuelva pesado.
     Retorna best_params y la predicción del test (en escala real).
     """
-    # Grid chico (6 fits)
     cps_grid = [0.01, 0.05, 0.1]
     sps_grid = [5.0, 10.0]
 
@@ -197,12 +329,9 @@ def _tune_prophet_monthly(train: pd.DataFrame, test: pd.DataFrame) -> dict:
         "yhat_test": None,
     }
 
-    # Transformación para estabilizar (muy útil en ventas crecientes)
     train_fit = train.copy()
     test_ds = test[["ds"]].copy()
 
-    # Clip suave de outliers en TRAIN (evita que 1 mes raro distorsione todo)
-    # Si no hay suficiente histórico, no aplicar.
     if len(train_fit) >= 24:
         clip_hi = float(train_fit["y"].quantile(0.99))
         train_fit["y"] = np.minimum(train_fit["y"].to_numpy(dtype=float), clip_hi)
@@ -231,43 +360,144 @@ def _tune_prophet_monthly(train: pd.DataFrame, test: pd.DataFrame) -> dict:
                 if mae < best["mae"]:
                     best.update({"mae": mae, "mape": mape, "cps": cps, "sps": sps, "yhat_test": yhat})
             except Exception:
-                # Si un set de parámetros falla, lo saltamos
                 continue
 
-    # Fallback si por alguna razón nada entrenó
     if best["yhat_test"] is None:
-        m = _build_prophet_monthly(n_months=len(train), changepoint_prior_scale=0.05, seasonality_prior_scale=10.0)
+        m = _build_prophet_monthly(
+            n_months=len(train),
+            changepoint_prior_scale=0.05,
+            seasonality_prior_scale=10.0
+        )
         m.fit(train)
         pred = m.predict(test[["ds"]])
         yhat = np.clip(pred["yhat"].to_numpy(dtype=float), 0, None)
-        best.update({"mae": float(mean_absolute_error(y_true_test, yhat)), "mape": _mape_percent(y_true_test, yhat), "yhat_test": yhat})
+        best.update({
+            "mae": float(mean_absolute_error(y_true_test, yhat)),
+            "mape": _mape_percent(y_true_test, yhat),
+            "yhat_test": yhat
+        })
 
     return best
 
 
-# -----------------------------
-# Views (NO tocan tus templates)
-# -----------------------------
+def _run_monthly_forecast(request, dataset: Dataset, context: dict) -> dict:
+    product_name = (request.POST.get("product_name") or "").strip()
+    horizon_months = int(request.POST.get("horizon_days") or 0)  # reutilizamos el mismo input
+
+    product = Product.objects.filter(dataset=dataset, name__iexact=product_name).first()
+    if not product:
+        context["error"] = "Producto no encontrado (selecciónalo de la lista)."
+        return context
+
+    qs = (
+        SaleDaily.objects
+        .filter(dataset=dataset, product=product)
+        .values("date")
+        .annotate(y=Sum("qty"))
+        .order_by("date")
+    )
+    df = pd.DataFrame(list(qs))
+    if df.empty:
+        context["error"] = "No hay datos para ese producto."
+        return context
+
+    df["ds"] = pd.to_datetime(df["date"])
+    df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).astype(float)
+    df = df[["ds", "y"]]
+    df_m = _prepare_series_monthly(df)
+
+    n_months = len(df_m)
+    if n_months < 12:
+        context["error"] = "Histórico insuficiente (mínimo recomendado: 12 meses)."
+        return context
+
+    horizon_max = _max_horizon_months(n_months)
+    context["horizon_max"] = horizon_max
+    context["horizon_unit"] = "meses"
+
+    if horizon_months < 1 or horizon_months > horizon_max:
+        context["error"] = f"Horizonte inválido. Máximo recomendado: {horizon_max} meses."
+        return context
+
+    split = int(n_months * 0.8)
+    train = df_m.iloc[:split].copy()
+    test = df_m.iloc[split:].copy()
+
+    tuned = _tune_prophet_monthly(train, test)
+    mae = float(tuned["mae"])
+    mape = tuned["mape"]
+
+    df_fit = df_m.copy()
+    if len(df_fit) >= 24:
+        clip_hi = float(df_fit["y"].quantile(0.99))
+        df_fit["y"] = np.minimum(df_fit["y"].to_numpy(dtype=float), clip_hi)
+    df_fit["y"] = np.log1p(df_fit["y"].astype(float))
+
+    m_full = _build_prophet_monthly(
+        n_months=len(df_fit),
+        changepoint_prior_scale=tuned["cps"],
+        seasonality_prior_scale=tuned["sps"],
+    )
+    m_full.fit(df_fit)
+
+    future = m_full.make_future_dataframe(periods=horizon_months, freq="MS", include_history=False)
+    fc_future = m_full.predict(future)
+    yhat_future = np.expm1(fc_future["yhat"].to_numpy(dtype=float))
+    yhat_future = np.clip(yhat_future, 0, None)
+
+    labels_hist = df_m["ds"].dt.strftime("%Y-%m").tolist()
+    hist_vals = np.round(df_m["y"].to_numpy(dtype=float), 2).tolist()
+
+    yhat_hist = [None] * len(train) + np.round(tuned["yhat_test"], 2).tolist()
+
+    labels_future = fc_future["ds"].dt.strftime("%Y-%m").tolist()
+    labels = labels_hist + labels_future
+
+    hist = hist_vals + [None] * len(labels_future)
+    yhat = yhat_hist + np.round(yhat_future, 2).tolist()
+
+    table_rows = list(zip(labels_future, np.round(yhat_future, 2).tolist()))
+
+    avg_y = float(df_m["y"].mean()) if len(df_m) else 0.0
+    nmae = (mae / avg_y * 100.0) if avg_y > 0 else None
+
+    context.update({
+        "product_name": product.name,
+        "horizon_days": horizon_months,
+        "mae": f"{mae:,.2f}",
+        "mape": "-" if mape is None else f"{mape:.2f}%",
+        "nmae": "-" if nmae is None else f"{nmae:.2f}%",
+        "avg_y": f"{avg_y:,.2f}",
+        "chart_payload": {"labels": labels, "hist": hist, "yhat": yhat},
+        "table_rows": table_rows,
+    })
+    return context
+
+
+# ============================================================
+# Views HTTP (COMPARTIDO)
+# ============================================================
 def upload_page(request):
     return render(request, "forecast/upload.html", {})
 
 
+#Verify fields in colums
 @require_POST
 def upload_api(request):
     session_key = _ensure_session(request)
 
     if "file" not in request.FILES:
-        return JsonResponse({"ok": False, "error": "No se recibió archivo (campo 'file')."}, status=400)
+        return JsonResponse({"ok": False, "error": "No se recibio el archivo"}, status=400)
 
     f = request.FILES["file"]
     lower = (f.name or "").lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".csv")):
-        return JsonResponse({"ok": False, "error": "Formato no soportado. Sube .xlsx/.xls o .csv."}, status=400)
+        return JsonResponse({"ok": False, "error": "Formato NO soportado. Intenta con .xlsx/.xls o .csv."}, status=400)
 
     try:
         daily = _read_user_file(f, f.name)
     except Exception as e:
-        return JsonResponse({"ok": False, "error": f"No se pudo procesar el archivo: {e}"}, status=400)
+        return JsonResponse({"ok": False, "error": f"No se puede procesar el archivo: {e}"}, status=400)
 
     try:
         with transaction.atomic():
@@ -294,6 +524,7 @@ def upload_api(request):
                     )
                 )
             SaleDaily.objects.bulk_create(rows, batch_size=BULK_BATCH_SIZE)
+
     except Exception as e:
         return JsonResponse({"ok": False, "error": f"No se pudo guardar el dataset en BD: {e}"}, status=500)
 
@@ -326,127 +557,29 @@ def index(request):
     if not dataset:
         return redirect("upload-page")
 
-    # Mantener las llaves que tu index.html ya espera (sin cambiar template)
+    # NUEVO: selector de granularidad
+    granularity = (request.POST.get("granularity") or request.GET.get("granularity") or "daily").strip().lower()
+    if granularity not in ("daily", "monthly"):
+        granularity = "daily"
+
     context = {
         "dataset_name": dataset.original_filename,
-        "horizon_max_default": 24,  # ahora interpretado como MESES
         "chart_payload": {"labels": [], "hist": [], "yhat": []},
         "table_rows": [],
+        # NUEVO: valores para el template
+        "granularity": granularity,
+        "horizon_max_default_daily": 90,
+        "horizon_max_default_monthly": 24,
+        "horizon_unit": "días" if granularity == "daily" else "meses",
+        "horizon_max_default": 90 if granularity == "daily" else 24,
     }
 
     if request.method != "POST":
         return render(request, "forecast/index.html", context)
 
-    product_name = (request.POST.get("product_name") or "").strip()
-    horizon_months = int(request.POST.get("horizon_days") or 0)  # mantenemos nombre del campo
-
-    product = Product.objects.filter(dataset=dataset, name__iexact=product_name).first()
-    if not product:
-        context["error"] = "Producto no encontrado (selecciónalo de la lista)."
-        return render(request, "forecast/index.html", context)
-
-    # Traer serie diaria agregada desde BD
-    qs = (
-        SaleDaily.objects
-        .filter(dataset=dataset, product=product)
-        .values("date")
-        .annotate(y=Sum("qty"))
-        .order_by("date")
-    )
-    df = pd.DataFrame(list(qs))
-    if df.empty:
-        context["error"] = "No hay datos para ese producto."
-        return render(request, "forecast/index.html", context)
-
-    # Diario -> Mensual
-    df["ds"] = pd.to_datetime(df["date"])
-    df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).astype(float)
-    df = df[["ds", "y"]]
-    df_m = _prepare_series_monthly(df)
-
-    n_months = len(df_m)
-    if n_months < 12:
-        context["error"] = "Histórico insuficiente (mínimo recomendado: 12 meses)."
-        return render(request, "forecast/index.html", context)
-
-    horizon_max = _max_horizon_months(n_months)
-    context["horizon_max"] = horizon_max
-
-    if horizon_months < 1 or horizon_months > horizon_max:
-        context["error"] = f"Horizonte inválido. Máximo recomendado: {horizon_max} meses."
-        return render(request, "forecast/index.html", context)
-
-    # Split 80/20 mensual
-    split = int(n_months * 0.8)
-    train = df_m.iloc[:split].copy()
-    test = df_m.iloc[split:].copy()
-
-    # Tuning + evaluación (predicción SOLO sobre test para que el MAE corresponda al gráfico)
-    tuned = _tune_prophet_monthly(train, test)
-    mae = float(tuned["mae"])
-    mape = tuned["mape"]
-
-    # Modelo final (entrena con TODO el histórico usando los mejores params encontrados)
-    df_fit = df_m.copy()
-    if len(df_fit) >= 24:
-        clip_hi = float(df_fit["y"].quantile(0.99))
-        df_fit["y"] = np.minimum(df_fit["y"].to_numpy(dtype=float), clip_hi)
-    df_fit["y"] = np.log1p(df_fit["y"].astype(float))
-
-    m_full = _build_prophet_monthly(
-        n_months=len(df_fit),
-        changepoint_prior_scale=tuned["cps"],
-        seasonality_prior_scale=tuned["sps"],
-    )
-    m_full.fit(df_fit)
-
-    # Futuro mensual: freq="MS" (inicio de mes)
-    future = m_full.make_future_dataframe(periods=horizon_months, freq="MS", include_history=False)
-    fc_future = m_full.predict(future)
-    yhat_future = np.expm1(fc_future["yhat"].to_numpy(dtype=float))
-    yhat_future = np.clip(yhat_future, 0, None)
-
-    # -----------------------------
-    # Chart payload coherente con MAE:
-    # - Hist: valores reales para todo el histórico
-    # - yhat: None en train, predicción en test, predicción en futuro
-    # -----------------------------
-    labels_hist = df_m["ds"].dt.strftime("%Y-%m").tolist()
-    hist_vals = np.round(df_m["y"].to_numpy(dtype=float), 2).tolist()
-
-    # yhat para histórico: None en train + pred_test en test
-    yhat_hist = [None] * len(train) + np.round(tuned["yhat_test"], 2).tolist()
-
-    # Añadir futuro
-    labels_future = fc_future["ds"].dt.strftime("%Y-%m").tolist()
-    labels = labels_hist + labels_future
-
-    hist = hist_vals + [None] * len(labels_future)
-    yhat = yhat_hist + np.round(yhat_future, 2).tolist()
-
-    # Tabla del futuro
-    table_rows = list(zip(labels_future, np.round(yhat_future, 2).tolist()))
-
-    avg_y = float(df_m["y"].mean()) if len(df_m) else 0.0
-    nmae = (mae / avg_y * 100.0) if avg_y > 0 else None
-
-    # Strings listos para UI
-    mae_str = f"{mae:,.2f}"
-    mape_str = "-" if mape is None else f"{mape:.2f}%"
-    nmae_str = "-" if nmae is None else f"{nmae:.2f}%"
-    avg_str = f"{avg_y:,.2f}"
-
-    context.update({
-        "product_name": product.name,
-        "horizon_days": horizon_months,  # mismo campo del template; ahora significa MESES
-        "mae": mae,
-        "mape": mape,
-        "chart_payload": {"labels": labels, "hist": hist, "yhat": yhat},
-        "table_rows": table_rows,
-        "mae": mae_str,
-        "mape": mape_str,
-        "nmae": nmae_str,  # MAE convertido a %
-        "avg_y": avg_str
-    })
+    if granularity == "monthly":
+        context = _run_monthly_forecast(request, dataset, context)
+    else:
+        context = _run_daily_forecast(request, dataset, context)
 
     return render(request, "forecast/index.html", context)

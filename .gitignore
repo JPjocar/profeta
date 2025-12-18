@@ -1,0 +1,35 @@
+# --- Python y Compilados ---
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+
+# --- Entornos Virtuales (¡MUY IMPORTANTE NO SUBIR ESTO!) ---
+env/
+venv/
+.env/
+.venv/
+
+# --- Django ---
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# --- Archivos Estáticos y Media ---
+# staticfiles es donde Render juntará tus estilos, no lo subas
+staticfiles/
+# media es donde se guardan los excels que subas probando localmente
+media/
+
+# --- Variables de Entorno y Secretos ---
+.env
+.env.local
+
+# --- IDEs y Sistema Operativo ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
