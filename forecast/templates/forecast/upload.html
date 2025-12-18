@@ -8,6 +8,9 @@
      <link rel="shortcut icon" href="static/jakataicon.png" />
 </head>
 <body>
+<div style="display:none;">
+      {% csrf_token %}
+  </div>
   <div class="glass">
     <h1>NoIntuition</h1>
     <div class="muted">Sube tu excel con columnas: id_venta, nombre_producto, fecha_venta y cantidad</div>
@@ -33,6 +36,9 @@
   </div>
 
 <script>
+
+    const CSRF_TOKEN = '{{ csrf_token }}';
+    const fileEl = document.getElementById("file");
   function getCookie(name){
     const v = `; ${document.cookie}`;
     const parts = v.split(`; ${name}=`);
@@ -71,8 +77,7 @@
 
     xhr = new XMLHttpRequest();
     xhr.open("POST", "/upload/", true);
-    xhr.setRequestHeader("X-CSRFToken", getCookie("csrftoken"));
-
+    xhr.setRequestHeader("X-CSRFToken", CSRF_TOKEN);
     progressBox.classList.remove("hidden");
     btnCancel.classList.remove("hidden");
     progressText.textContent = "Cargando excel…";
