@@ -557,7 +557,7 @@ def index(request):
     if not dataset:
         return redirect("upload-page")
 
-    # NUEVO: selector de granularidad
+    # Select el nivel de detalle (daily/monthly)
     granularity = (request.POST.get("granularity") or request.GET.get("granularity") or "daily").strip().lower()
     if granularity not in ("daily", "monthly"):
         granularity = "daily"
@@ -566,7 +566,6 @@ def index(request):
         "dataset_name": dataset.original_filename,
         "chart_payload": {"labels": [], "hist": [], "yhat": []},
         "table_rows": [],
-        # NUEVO: valores para el template
         "granularity": granularity,
         "horizon_max_default_daily": 90,
         "horizon_max_default_monthly": 24,
