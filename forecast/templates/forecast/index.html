@@ -28,7 +28,7 @@
         <input type="number" name="horizon_days" id="horizonInput" min="1"
                placeholder="Ej: 30" />
         <small id="horizonHelp">
-          Máximo recomendado: {{ horizon_max|default:horizon_max_default }}
+          Maximo aceptable: {{ horizon_max|default:horizon_max_default }}
         </small>
 
           <label for="granularity">Frecuencia:</label>
@@ -39,15 +39,13 @@
 
         <button type="submit">Predecir</button>
 
-        {% if horizon_max %}
-          <div class="muted" style="margin-top:10px;">Máximo recomendado para este producto: {{ horizon_max }} días</div>
-        {% endif %}
+
         {% if error %}
           <div class="error" style="margin-top:12px;">{{ error }}</div>
         {% endif %}
       </form>
 
-      <div style="margin-top:14px;" class="muted">Productos (scroll, 100 por carga)</div>
+      <div style="margin-top:14px;" class="muted">Productos</div>
       <div id="productList" class="list"></div>
     </div>
 
@@ -161,7 +159,7 @@ const muted = document.getElementById("muted");
         labels,
         datasets: [
           { label: "Historico", data: hist, spanGaps: true, borderWidth: 2 },
-          { label: "Predicción", data: yhat, borderWidth: 2 },
+          { label: "Prediccion", data: yhat, borderWidth: 2 },
         ]
       },
       options: {
