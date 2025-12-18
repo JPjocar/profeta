@@ -150,17 +150,17 @@ const muted = document.getElementById("muted");
   const ctx = document.getElementById("chart").getContext("2d");
 
   if (!labels.length){
-    // No rompe si aún no hay predicción
+    // Si no hay prediccion
     ctx.font = "14px system-ui";
     ctx.fillStyle = "rgba(234,240,255,0.8)";
-    ctx.fillText("Genera una predicción para ver el gráfico.", 10, 30);
+    ctx.fillText("Genera una prediccion para visualizar el grafico", 10, 30);
   } else {
     new Chart(ctx, {
       type: "line",
       data: {
         labels,
         datasets: [
-          { label: "Histórico", data: hist, spanGaps: true, borderWidth: 2 },
+          { label: "Historico", data: hist, spanGaps: true, borderWidth: 2 },
           { label: "Predicción", data: yhat, borderWidth: 2 },
         ]
       },

@@ -5,21 +5,15 @@ from django.shortcuts import render, redirect
 from django.views.decorators.http import require_POST
 from django.db import transaction
 from django.db.models import Sum
-
 import pandas as pd
 import numpy as np
-
 from prophet import Prophet
 from sklearn.metrics import mean_absolute_error
-
 from .models import Dataset, Product, SaleDaily
 
-
-# ============================================================
-# Configuración general del Excel estándar (COMPARTIDO)
-# ============================================================
 REQUIRED_COLS = ["id_venta", "nombre_producto", "fecha_venta", "cantidad"]
 
+# Solo en caso de CSV (funciona pero no utilizarlo)
 CSV_CHUNKSIZE = 200_000
 BULK_BATCH_SIZE = 5000
 
@@ -38,13 +32,6 @@ def _get_dataset(request) -> Dataset | None:
 
 # Clean data and validate
 def _normalize_and_validate(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Recibe un DataFrame con las columnas requeridas.
-    Devuelve un DataFrame limpio con columnas:
-      - nombre_producto (str)
-      - ds (datetime64[ns]) -> día (sin hora)
-      - y (float) -> cantidad (sumable)
-    """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -105,15 +92,8 @@ def _read_user_file(file_obj, filename: str) -> pd.DataFrame:
     return daily
 
 
-# ============================================================
-# ----------- BLOQUE DAILY (copiado de tu daily) -------------
-# ============================================================
+# Prophet personalizado para daily segun la cantidad de datos
 def build_prophet(n_days: int) -> Prophet:
-    """
-    Crea un Prophet apropiado según el tamaño del histórico (en días).
-    - Con poco histórico: modelo conservador (evita sobreajuste).
-    - Con más histórico: permite más componentes.
-    """
     weekly = n_days >= 14
     yearly = n_days >= 365
 
@@ -128,7 +108,6 @@ def build_prophet(n_days: int) -> Prophet:
         seasonality_mode="multiplicative",
     )
 
-    # “Mensual” aproximada solo si hay suficiente histórico (evita inventar ondas con pocos días)
     if n_days >= 90:
         m.add_seasonality(name="monthly", period=30.5, fourier_order=5)
 
@@ -136,25 +115,19 @@ def build_prophet(n_days: int) -> Prophet:
 
 
 def _max_horizon_days(n_days: int) -> int:
-    """
-    Límite de horizonte para evitar extrapolación mala.
-    Regla: máximo 90 días, y nunca más de la mitad del histórico.
-    """
+    # Max: 90 days, Min: No mas de la mitad
     return max(3, min(90, n_days // 2))
 
 
+# Rellenar los dias faltantes con cero
 def _prepare_series_daily(df_product: pd.DataFrame) -> pd.DataFrame:
-    """
-    Entrada: df_product con ds,y para un producto.
-    Salida: serie diaria continua (rellena días faltantes con 0).
-    """
     df_product = df_product.sort_values("ds").copy()
 
-    # Rango completo diario
+    # Obtener el rango completo diario
     full = pd.DataFrame({"ds": pd.date_range(df_product["ds"].min(), df_product["ds"].max(), freq="D")})
     out = full.merge(df_product[["ds", "y"]], on="ds", how="left")
 
-    # Día sin registro = 0 ventas (retail)
+    # Dias sin registro llenar con cero ventas
     out["y"] = pd.to_numeric(out["y"], errors="coerce").fillna(0.0).astype(float)
     return out
 
@@ -165,10 +138,10 @@ def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
 
     product = Product.objects.filter(dataset=dataset, name__iexact=product_name).first()
     if not product:
-        context["error"] = "Producto no encontrado (selecciónalo de la lista)."
+        context["error"] = "Producto no encontrado(selecciona de la lista)"
         return context
 
-    # Serie diaria agregada desde BD
+    # Agrega la serie desde la DB
     qs = (
         SaleDaily.objects
         .filter(dataset=dataset, product=product)
@@ -178,7 +151,7 @@ def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
     )
     df = pd.DataFrame(list(qs))
     if df.empty:
-        context["error"] = "No hay datos para ese producto."
+        context["error"] = "No hay registros para ese producto"
         return context
 
     df["ds"] = pd.to_datetime(df["date"])
@@ -188,7 +161,7 @@ def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
 
     n_days = len(df)
     if n_days < 14:
-        context["error"] = "Histórico insuficiente (mínimo recomendado: 14 días)."
+        context["error"] = "Historico insuficiente(minimo recomendado >= 14 días)."
         return context
 
     horizon_max = _max_horizon_days(n_days)
@@ -196,28 +169,29 @@ def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
     context["horizon_unit"] = "días"
 
     if horizon < 1 or horizon > horizon_max:
-        context["error"] = f"Horizonte inválido. Máximo recomendado: {horizon_max} días."
+        context["error"] = f"Horizonte incorrecto. Maximo aceptable: {horizon_max} dias"
         return context
 
-    # Split 80/20 temporal
+    # Split 80/20 Prophet
     split = int(n_days * 0.8)
     train = df.iloc[:split].copy()
     test = df.iloc[split:].copy()
 
-    # Modelo para evaluación
+    # Modelo para entrenamiento
     m = build_prophet(len(train))
     m.fit(train)
 
+    # Predecir test
     pred_test = m.predict(test[["ds"]])
     mae = float(mean_absolute_error(test["y"].to_numpy(), pred_test["yhat"].to_numpy()))
 
-    # MAPE (ignora y_true == 0)
+    # Calcular MAPE
     y_true = test["y"].to_numpy(dtype=float)
     y_pred = pred_test["yhat"].to_numpy(dtype=float)
     mask = y_true != 0
     mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0) if mask.any() else None
 
-    # Modelo final con todo el histórico
+    # Modelo utilizando el historico completo
     m2 = build_prophet(len(df))
     m2.fit(df)
 
@@ -236,7 +210,7 @@ def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
         future_table["yhat"].clip(lower=0).round(2).tolist()
     ))
 
-    # UI: formateo opcional coherente con tu mensual (strings)
+    # Dar formato mensual de fecha
     avg_y = float(df["y"].mean()) if len(df) else 0.0
     nmae = (mae / avg_y * 100.0) if avg_y > 0 else None
 
@@ -254,14 +228,9 @@ def _run_daily_forecast(request, dataset: Dataset, context: dict) -> dict:
     return context
 
 
-# ============================================================
-# --------- BLOQUE MONTHLY (copiado de tu mensual) -----------
-# ============================================================
+# Convert daily to monthly
 def _prepare_series_monthly(df_daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    Entrada: df_daily con ds (datetime) y y (float) a nivel diario.
-    Salida: serie mensual continua con ds en inicio de mes (MS) y relleno de meses faltantes con 0.
-    """
+
     dfp = df_daily.sort_values("ds").copy()
     dfp["ds"] = pd.to_datetime(dfp["ds"])
 
@@ -274,21 +243,15 @@ def _prepare_series_monthly(df_daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def _max_horizon_months(n_months: int) -> int:
-    """
-    Límite de horizonte para evitar extrapolación mala:
-    - máximo 24 meses
-    - nunca más de la mitad del histórico
-    """
+    # Max: 24 months Min: No mas de la mitad de los datos
     return max(1, min(24, n_months // 2))
 
 
-def _build_prophet_monthly(
-    n_months: int,
-    changepoint_prior_scale: float = 0.05,
-    seasonality_prior_scale: float = 10.0,
-) -> Prophet:
+def _build_prophet_monthly(n_months: int, changepoint_prior_scale: float = 0.05, seasonality_prior_scale: float = 10.0,) -> Prophet:
+    #Establecer True si hay registros de años
     yearly = n_months >= 24
 
+    #Best cantidad de changepoints
     n_changepoints = int(min(25, max(5, n_months // 2)))
 
     m = Prophet(
@@ -304,6 +267,7 @@ def _build_prophet_monthly(
     return m
 
 
+# Calculo del mape percent
 def _mape_percent(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
     y_true = y_true.astype(float)
     y_pred = y_pred.astype(float)
@@ -314,10 +278,7 @@ def _mape_percent(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
 
 
 def _tune_prophet_monthly(train: pd.DataFrame, test: pd.DataFrame) -> dict:
-    """
-    Tuning pequeño para bajar MAE sin que se vuelva pesado.
-    Retorna best_params y la predicción del test (en escala real).
-    """
+    # Hallar los mejores parametros para el modelo
     cps_grid = [0.01, 0.05, 0.1]
     sps_grid = [5.0, 10.0]
 
@@ -382,11 +343,11 @@ def _tune_prophet_monthly(train: pd.DataFrame, test: pd.DataFrame) -> dict:
 
 def _run_monthly_forecast(request, dataset: Dataset, context: dict) -> dict:
     product_name = (request.POST.get("product_name") or "").strip()
-    horizon_months = int(request.POST.get("horizon_days") or 0)  # reutilizamos el mismo input
+    horizon_months = int(request.POST.get("horizon_days") or 0)
 
     product = Product.objects.filter(dataset=dataset, name__iexact=product_name).first()
     if not product:
-        context["error"] = "Producto no encontrado (selecciónalo de la lista)."
+        context["error"] = "Producto no encontrado en lista"
         return context
 
     qs = (
@@ -398,7 +359,7 @@ def _run_monthly_forecast(request, dataset: Dataset, context: dict) -> dict:
     )
     df = pd.DataFrame(list(qs))
     if df.empty:
-        context["error"] = "No hay datos para ese producto."
+        context["error"] = "No hay datos para el producto seleccionado"
         return context
 
     df["ds"] = pd.to_datetime(df["date"])
@@ -408,15 +369,16 @@ def _run_monthly_forecast(request, dataset: Dataset, context: dict) -> dict:
 
     n_months = len(df_m)
     if n_months < 12:
-        context["error"] = "Histórico insuficiente (mínimo recomendado: 12 meses)."
+        context["error"] = "Historico insuficiente(minimo recomendado >= 12 meses)"
         return context
 
+    # Show max horizon months to user
     horizon_max = _max_horizon_months(n_months)
     context["horizon_max"] = horizon_max
     context["horizon_unit"] = "meses"
 
     if horizon_months < 1 or horizon_months > horizon_max:
-        context["error"] = f"Horizonte inválido. Máximo recomendado: {horizon_max} meses."
+        context["error"] = f"Horizonte incorrecto. Maximo es: {horizon_max} meses."
         return context
 
     split = int(n_months * 0.8)
@@ -474,9 +436,7 @@ def _run_monthly_forecast(request, dataset: Dataset, context: dict) -> dict:
     return context
 
 
-# ============================================================
-# Views HTTP (COMPARTIDO)
-# ============================================================
+# Upload page
 def upload_page(request):
     return render(request, "forecast/upload.html", {})
 
